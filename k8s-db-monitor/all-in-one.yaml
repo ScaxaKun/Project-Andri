@@ -1,0 +1,346 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: db-monitor-cm
+data:
+  # --- CREDENTIAL DATABASE ---
+  MYSQL_HOST: "mysql-cluster-mysql.default.svc.cluster.local"
+  MYSQL_USER: "root"
+  MYSQL_PASS: "password_mysql_kamu"
+  
+  MARIADB_HOST: "mariadb-repl-primary"
+  MARIADB_USER: "root"
+  MARIADB_PASS: "Wc3Q~w_7+7rM8(5E"
+  
+  PG_HOST: "pg-cluster-rw.default.svc.cluster.local"
+  PG_USER: "postgres"
+  PG_PASS: "password_pg_kamu"
+  
+  MSSQL_HOST: "mssql-ag-listener"
+  MSSQL_USER: "sa"
+  MSSQL_PASS: "YourStrong!Passw0rd"
+  
+  MONGO_HOST: "mongo-cluster-mongodb.default.svc.cluster.local"
+  MONGO_USER: "root"
+  MONGO_PASS: "password_mongo_kamu"
+
+  # --- KODE APLIKASI WEB ---
+  index.php: |
+    <?php
+    $action = $_GET['action'] ?? '';
+
+    $config = [
+        'mysql' => ['dsn' => 'mysql:host=' . getenv('MYSQL_HOST') . ';dbname=testdb', 'user' => getenv('MYSQL_USER'), 'pass' => getenv('MYSQL_PASS')],
+        'mariadb' => ['dsn' => 'mysql:host=' . getenv('MARIADB_HOST') . ';dbname=testdb', 'user' => getenv('MARIADB_USER'), 'pass' => getenv('MARIADB_PASS')],
+        'postgres' => ['dsn' => 'pgsql:host=' . getenv('PG_HOST') . ';dbname=testdb', 'user' => getenv('PG_USER'), 'pass' => getenv('PG_PASS')],
+        'sqlserver' => ['dsn' => 'dblib:host=' . getenv('MSSQL_HOST') . ';dbname=testdb', 'user' => getenv('MSSQL_USER'), 'pass' => getenv('MSSQL_PASS')],
+        'mongodb' => ['uri' => 'mongodb://' . getenv('MONGO_USER') . ':' . getenv('MONGO_PASS') . '@' . getenv('MONGO_HOST')]
+    ];
+
+    function setupTable($pdo, $db) {
+        if ($db === 'sqlserver') {
+            $pdo->exec("IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='test_table' and xtype='U') CREATE TABLE test_table (id INT IDENTITY(1,1), message VARCHAR(255))");
+        } elseif ($db === 'postgres') {
+            $pdo->exec("CREATE TABLE IF NOT EXISTS test_table (id SERIAL PRIMARY KEY, message VARCHAR(255))");
+        } else {
+            $pdo->exec("CREATE TABLE IF NOT EXISTS test_table (id INT AUTO_INCREMENT PRIMARY KEY, message VARCHAR(255))");
+        }
+    }
+
+    if ($action === 'status') {
+        header('Content-Type: application/json');
+        $response = [];
+        foreach ($config as $db => $cred) {
+            $status = "🔴 Offline";
+            $logs = [];
+            try {
+                if ($db === 'mongodb') {
+                    $manager = new MongoDB\Driver\Manager($cred['uri']);
+                    $manager->executeCommand('admin', new MongoDB\Driver\Command(['ping' => 1]));
+                    $status = "🟢 Online";
+                    
+                    $query = new MongoDB\Driver\Query([], ['limit' => 3, 'sort' => ['_id' => -1]]);
+                    $cursor = $manager->executeQuery('testdb.test_table', $query);
+                    foreach ($cursor as $doc) { $logs[] = $doc->message ?? ''; }
+                } else {
+                    $pdo = new PDO($cred['dsn'], $cred['user'], $cred['pass'], [PDO::ATTR_TIMEOUT => 2, PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
+                    $status = "🟢 Online";
+                    setupTable($pdo, $db);
+
+                    $q = ($db === 'sqlserver') ? "SELECT TOP 3 message FROM test_table ORDER BY id DESC" : "SELECT message FROM test_table ORDER BY id DESC LIMIT 3";
+                    $stmt = $pdo->query($q);
+                    while ($row = $stmt->fetch(PDO::FETCH_ASSOC)) { $logs[] = $row['message']; }
+                }
+            } catch (Throwable $e) {
+                $logs[] = "Error: " . $e->getMessage();
+            }
+            $response[$db] = ['status' => $status, 'logs' => $logs];
+        }
+        echo json_encode($response);
+        exit;
+    }
+
+    if ($action === 'crud') {
+        header('Content-Type: application/json');
+        $db = $_GET['db'] ?? '';
+        $op = $_GET['op'] ?? 'read';
+        $msg = $_POST['msg'] ?? '';
+        $id = $_POST['id'] ?? '';
+        $cred = $config[$db] ?? null;
+
+        if (!$cred) die(json_encode(['success' => false, 'error' => 'DB not found']));
+
+        try {
+            if ($db === 'mongodb') {
+                $manager = new MongoDB\Driver\Manager($cred['uri']);
+                if ($op === 'create' || $op === 'test') {
+                    $bulk = new MongoDB\Driver\BulkWrite;
+                    $m = ($op === 'test') ? "Tes Koneksi OK: " . date('H:i:s') : $msg;
+                    $bulk->insert(['message' => $m]);
+                    $manager->executeBulkWrite('testdb.test_table', $bulk);
+                } elseif ($op === 'delete') {
+                    $bulk = new MongoDB\Driver\BulkWrite;
+                    $bulk->delete(['_id' => new MongoDB\BSON\ObjectId($id)]);
+                    $manager->executeBulkWrite('testdb.test_table', $bulk);
+                } elseif ($op === 'clear') {
+                    $bulk = new MongoDB\Driver\BulkWrite;
+                    $bulk->delete([]);
+                    $manager->executeBulkWrite('testdb.test_table', $bulk);
+                } elseif ($op === 'read') {
+                    $query = new MongoDB\Driver\Query([], ['limit' => 50, 'sort' => ['_id' => -1]]);
+                    $cursor = $manager->executeQuery('testdb.test_table', $query);
+                    $data = [];
+                    foreach ($cursor as $doc) {
+                        $data[] = ['id' => (string)$doc->_id, 'message' => $doc->message ?? ''];
+                    }
+                    echo json_encode(['success' => true, 'data' => $data]);
+                    exit;
+                }
+            } else {
+                $pdo = new PDO($cred['dsn'], $cred['user'], $cred['pass'], [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
+                if ($op === 'create' || $op === 'test') {
+                    $m = ($op === 'test') ? "Tes Koneksi OK: " . date('H:i:s') : $msg;
+                    $stmt = $pdo->prepare("INSERT INTO test_table (message) VALUES (?)");
+                    $stmt->execute([$m]);
+                } elseif ($op === 'delete') {
+                    $stmt = $pdo->prepare("DELETE FROM test_table WHERE id = ?");
+                    $stmt->execute([$id]);
+                } elseif ($op === 'clear') {
+                    $pdo->exec("DELETE FROM test_table");
+                } elseif ($op === 'read') {
+                    $q = ($db === 'sqlserver') ? "SELECT TOP 50 id, message FROM test_table ORDER BY id DESC" : "SELECT id, message FROM test_table ORDER BY id DESC LIMIT 50";
+                    $stmt = $pdo->query($q);
+                    $data = $stmt->fetchAll(PDO::FETCH_ASSOC);
+                    echo json_encode(['success' => true, 'data' => $data]);
+                    exit;
+                }
+            }
+            echo json_encode(['success' => true]);
+        } catch (Throwable $e) {
+            echo json_encode(['success' => false, 'error' => $e->getMessage()]);
+        }
+        exit;
+    }
+    ?>
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>HA DB Monitor</title>
+        <style>
+            body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; padding: 20px; background: #f4f6f9; color: #333; }
+            h2 { color: #2c3e50; border-bottom: 2px solid #ddd; padding-bottom: 10px; }
+            .card-container { display: flex; flex-wrap: wrap; gap: 15px; margin-bottom: 30px; }
+            .card { background: white; border: 1px solid #e0e0e0; padding: 15px; width: calc(20% - 15px); min-width: 220px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); border-radius: 8px; }
+            .card h3 { margin: 0 0 10px 0; font-size: 16px; color: #34495e; }
+            .status-text { font-weight: bold; margin-bottom: 10px; font-size: 14px; }
+            .terminal { background: #1e1e1e; color: #4af626; padding: 10px; height: 80px; overflow-y: auto; font-family: monospace; font-size: 11px; border-radius: 4px; margin-bottom: 10px; word-wrap: break-word;}
+            .terminal ul { margin: 0; padding-left: 15px; }
+            .btn-group { display: flex; gap: 5px; }
+            button { flex: 1; padding: 8px; cursor: pointer; border: none; border-radius: 4px; font-weight: bold; transition: 0.2s; }
+            .btn-primary { background: #3498db; color: white; }
+            .btn-primary:hover { background: #2980b9; }
+            .btn-danger { background: #e74c3c; color: white; }
+            .btn-danger:hover { background: #c0392b; }
+            button:disabled { background: #bdc3c7; cursor: not-allowed; opacity: 0.5; }
+            
+            .crud-section { background: white; padding: 20px; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); }
+            .crud-controls { display: flex; gap: 10px; margin-bottom: 15px; }
+            select, input[type="text"] { padding: 10px; border: 1px solid #ddd; border-radius: 4px; outline: none; }
+            select { font-weight: bold; }
+            input[type="text"] { flex: 1; }
+            
+            table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+            th, td { border: 1px solid #ecf0f1; padding: 10px; text-align: left; }
+            th { background-color: #f8f9fa; }
+            td button { width: auto; padding: 5px 10px; font-size: 12px; }
+        </style>
+    </head>
+    <body>
+        <h2>Status High Availability (Real-Time)</h2>
+        <div class="card-container" id="db-status-container">
+            <p>Memuat status database...</p>
+        </div>
+
+        <div class="crud-section">
+            <h2>Manajemen Data (CRUD) Terpadu</h2>
+            <div class="crud-controls">
+                <select id="crud-db" onchange="loadCrudData()">
+                    <option value="mysql">MySQL</option>
+                    <option value="mariadb">MariaDB</option>
+                    <option value="postgres">PostgreSQL</option>
+                    <option value="sqlserver">SQL Server</option>
+                    <option value="mongodb">MongoDB</option>
+                </select>
+                <input type="text" id="crud-msg" placeholder="Ketik pesan/data baru di sini...">
+                <button class="btn-primary" style="flex: 0 0 120px;" onclick="doAction('create')">Tambah Data</button>
+            </div>
+            
+            <table>
+                <thead>
+                    <tr>
+                        <th width="15%">ID</th>
+                        <th width="70%">Data (Message)</th>
+                        <th width="15%">Aksi</th>
+                    </tr>
+                </thead>
+                <tbody id="crud-table-body">
+                    <tr><td colspan="3" style="text-align:center;">Pilih database dan tunggu...</td></tr>
+                </tbody>
+            </table>
+        </div>
+
+        <script>
+            function doAction(op, specificDb = null, dataId = null) {
+                let targetDb = specificDb || document.getElementById('crud-db').value;
+                let msg = document.getElementById('crud-msg').value;
+                
+                let formData = new URLSearchParams();
+                if(dataId) formData.append('id', dataId);
+                if(op === 'create') {
+                    if(!msg) return alert("Pesan tidak boleh kosong!");
+                    formData.append('msg', msg);
+                }
+
+                fetch(`?action=crud&db=${targetDb}&op=${op}`, { method: 'POST', body: formData })
+                .then(res => res.json())
+                .then(data => {
+                    document.getElementById('crud-msg').value = ''; 
+                    if(op === 'create' || op === 'delete') loadCrudData(); 
+                    fetchStatus(); 
+                });
+            }
+
+            function loadCrudData() {
+                let targetDb = document.getElementById('crud-db').value;
+                let tbody = document.getElementById('crud-table-body');
+                tbody.innerHTML = '<tr><td colspan="3" style="text-align:center;">Memuat data...</td></tr>';
+                
+                fetch(`?action=crud&db=${targetDb}&op=read`)
+                    .then(res => res.json())
+                    .then(res => {
+                        if(!res.success || !res.data || res.data.length === 0) {
+                            tbody.innerHTML = `<tr><td colspan="3" style="text-align:center; color:gray;">Tidak ada data atau koneksi terputus.</td></tr>`;
+                            return;
+                        }
+                        let html = '';
+                        res.data.forEach(row => {
+                            html += `<tr>
+                                <td>${row.id}</td>
+                                <td>${row.message}</td>
+                                <td><button class="btn-danger" onclick="doAction('delete', null, '${row.id}')">Hapus</button></td>
+                            </tr>`;
+                        });
+                        tbody.innerHTML = html;
+                    });
+            }
+
+            function fetchStatus() {
+                fetch('?action=status')
+                    .then(res => res.json())
+                    .then(data => {
+                        let html = '';
+                        ['mysql', 'mariadb', 'postgres', 'sqlserver', 'mongodb'].forEach(db => {
+                            let info = data[db];
+                            let isOffline = info.status.includes('Offline');
+                            let logList = info.logs.map(l => `<li>${l}</li>`).join('');
+                            if(!logList) logList = "<li>[ Kosong ]</li>";
+
+                            html += `
+                                <div class="card" style="border-top: 5px solid ${isOffline ? '#e74c3c' : '#2ecc71'}">
+                                    <h3>${db.toUpperCase()}</h3>
+                                    <p class="status-text">${info.status}</p>
+                                    <div class="terminal"><ul>${logList}</ul></div>
+                                    <div class="btn-group">
+                                        <button class="btn-primary" onclick="doAction('test', '${db}')" ${isOffline ? 'disabled' : ''}>Tes Koneksi</button>
+                                        <button class="btn-danger" onclick="doAction('clear', '${db}')" ${isOffline ? 'disabled' : ''}>Clear</button>
+                                    </div>
+                                </div>
+                            `;
+                        });
+                        document.getElementById('db-status-container').innerHTML = html;
+                    });
+            }
+
+            fetchStatus();
+            loadCrudData();
+            setInterval(fetchStatus, 3000); 
+        </script>
+    </body>
+    </html>
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: db-monitor-app
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: db-monitor
+  template:
+    metadata:
+      labels:
+        app: db-monitor
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: "node1" 
+      containers:
+      - name: php-server
+        image: ubuntu:24.04
+        command: ["/bin/bash", "-c"]
+        args:
+          - |
+            apt-get update && \
+            DEBIAN_FRONTEND=noninteractive apt-get install -y php-cli php-mysql php-pgsql php-mongodb php-sybase curl && \
+            echo "Instalasi selesai. Menjalankan web server..." && \
+            exec php -S 0.0.0.0:80 -t /var/www/html
+        ports:
+        - containerPort: 80
+        envFrom:
+        - configMapRef:
+            name: db-monitor-cm
+        volumeMounts:
+        - name: code-volume
+          mountPath: /var/www/html
+      volumes:
+      - name: code-volume
+        configMap:
+          name: db-monitor-cm
+          items:
+          - key: index.php
+            path: index.php
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: db-monitor-svc
+spec:
+  type: NodePort
+  selector:
+    app: db-monitor
+  ports:
+    - port: 80
+      targetPort: 80
+      nodePort: 30400

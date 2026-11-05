@@ -1,0 +1,41 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: db-monitor-app
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: db-monitor
+  template:
+    metadata:
+      labels:
+        app: db-monitor
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: "node1" 
+      containers:
+      - name: php-server
+        image: ubuntu:24.04
+        command: ["/bin/bash", "-c"]
+        args:
+          - |
+            apt-get update && \
+            DEBIAN_FRONTEND=noninteractive apt-get install -y php-cli php-mysql php-pgsql php-mongodb php-sybase curl && \
+            echo "Instalasi selesai. Menjalankan web server..." && \
+            exec php -S 0.0.0.0:80 -t /var/www/html
+        ports:
+        - containerPort: 80
+        envFrom:
+        - configMapRef:
+            name: db-monitor-cm
+        volumeMounts:
+        - name: code-volume
+          mountPath: /var/www/html
+      volumes:
+      - name: code-volume
+        configMap:
+          name: db-monitor-cm
+          items:
+          - key: index.php
+            path: index.php
